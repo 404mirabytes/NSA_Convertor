@@ -298,6 +298,24 @@ def build_template_index(zf: zipfile.ZipFile) -> Dict[str, str]:
     return tpl
 
 
+def build_resource_index(zf: zipfile.ZipFile) -> Dict[str, str]:
+    """
+    Map resource id (basename without extension) -> zip member path (Resources/.../image)
+    """
+    exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+    res = {}
+    for n in zf.namelist():
+        if "/Resources/" not in n or n.endswith("/"):
+            continue
+        _, ext = os.path.splitext(n)
+        if ext.lower() not in exts:
+            continue
+        base = os.path.splitext(os.path.basename(n))[0]
+        res.setdefault(base, n)
+        res.setdefault(base.lower(), n)
+    return res
+
+
 def open_template_cached(cache: Dict[str, fitz.Document], zf: zipfile.ZipFile, member: str) -> fitz.Document:
     if member in cache:
         return cache[member]
@@ -315,6 +333,7 @@ def draw_page_annotations(
     ann_member: str,
     sx: float,
     sy: float,
+    resource_index: Dict[str, str],
     highlighter_types: set,
     highlighter_opacity: float,
     hl_width_mults: Dict[int, float],
@@ -345,6 +364,43 @@ def draw_page_annotations(
                 break
 
         invert_y = choose_invert_y(sample_pts, out_page.rect.width, out_page.rect.height, sx, sy)
+
+        # -------- images (annotationType=2) --------
+        for img_id, bx, by, bw, bh, _img_tx, _tx in cur.execute(
+            "SELECT id, boundingRect_x, boundingRect_y, boundingRect_w, boundingRect_h, imgTxMatrix, txMatrix "
+            "FROM annotation WHERE annotationType=2"
+        ):
+            if not img_id or bw is None or bh is None:
+                continue
+
+            img_id_str = str(img_id)
+            member = resource_index.get(img_id_str)
+            if not member:
+                base = os.path.splitext(img_id_str)[0]
+                member = resource_index.get(base) or resource_index.get(base.lower())
+            if not member:
+                continue
+
+            try:
+                img_bytes = zf.read(member)
+            except Exception:
+                continue
+
+            x0 = float(bx or 0.0) * sx
+            y0 = float(by or 0.0) * sy
+            w = float(bw) * sx
+            h = float(bh) * sy
+            if w <= 0 or h <= 0:
+                continue
+
+            if invert_y:
+                y0 = out_page.rect.height - y0 - h
+
+            rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+            try:
+                out_page.insert_image(rect, stream=img_bytes)
+            except Exception:
+                continue
 
         # -------- ink strokes (annotationType=0) --------
         groups = defaultdict(list)  # (rgb,width,opacity) -> list[polyline]
@@ -469,6 +525,7 @@ def nsa_to_pdf(
 
         ann_index = build_annotation_index(zf)
         tpl_index = build_template_index(zf)
+        res_index = build_resource_index(zf)
 
         # PenType stats pro auto-detekci zvýrazňovače
         ann_members_all = list(ann_index.values())
@@ -528,6 +585,7 @@ def nsa_to_pdf(
                     ann_member=ann_index[uuid],
                     sx=sx,
                     sy=sy,
+                    resource_index=res_index,
                     highlighter_types=set(hl_types),
                     highlighter_opacity=highlighter_opacity,
                     hl_width_mults=hl_mults,
