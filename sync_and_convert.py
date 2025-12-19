@@ -75,9 +75,12 @@ class CloudSyncManager:
         
         return current_hash != stored_hash
     
-    def convert_file(self, nsa_file: Path, pdf_path: Optional[Path] = None, verbose: bool = True) -> bool:
+    def convert_file(self, nsa_file: Path, pdf_path: Optional[Path] = None, verbose: bool = True, metadata: dict = None) -> bool:
         """Convert single NSA file to PDF"""
         try:
+            if metadata is None:
+                metadata = {}
+                
             if pdf_path is None:
                 pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
             else:
@@ -112,7 +115,9 @@ class CloudSyncManager:
             self.state["files"][file_key] = {
                 "hash": self._file_hash(nsa_file),
                 "last_converted": datetime.now().isoformat(),
-                "pdf_path": str(pdf_file)
+                "pdf_path": str(pdf_file),
+                "gdrive_md5": metadata.get('md5_checksum'),  # Store GDrive checksum
+                "gdrive_modified": metadata.get('modified_time')
             }
             self._save_state()
             
@@ -248,12 +253,13 @@ class GoogleDriveSync(CloudSyncManager):
             
             results = self.service.files().list(
                 q=query,
-                fields="files(id, name, modifiedTime, parents)",
+                fields="files(id, name, modifiedTime, md5Checksum, parents)",
                 pageSize=1000
             ).execute()
             
             files = results.get('files', [])
             downloaded = 0
+            skipped = 0
             
             if verbose:
                 print(f"Found {len(files)} .nsa files on Google Drive")
@@ -270,10 +276,37 @@ class GoogleDriveSync(CloudSyncManager):
                 # Store metadata for later conversion
                 self.file_metadata[file['name']] = {
                     'folder_path': folder_path,
-                    'file_id': file['id']
+                    'file_id': file['id'],
+                    'md5_checksum': file.get('md5Checksum'),
+                    'modified_time': file.get('modifiedTime')
                 }
                 
+                # Check if we need to download this file
+                state_key = str(local_path)
+                stored_state = self.state["files"].get(state_key, {})
+                stored_checksum = stored_state.get("gdrive_md5")
+                current_checksum = file.get('md5Checksum')
+                
+                # Skip download if file exists locally and hasn't changed on GDrive
+                if (local_path.exists() and 
+                    current_checksum and 
+                    stored_checksum == current_checksum):
+                    if verbose:
+                        print(f"Skipping {file['name']} (unchanged)")
+                    skipped += 1
+                    
+                    # Update state to ensure metadata is current
+                    self.state["files"][state_key] = {
+                        **stored_state,
+                        "gdrive_md5": current_checksum,
+                        "gdrive_modified": file.get('modifiedTime')
+                    }
+                    continue
+                
                 # Download file
+                if verbose:
+                    print(f"Downloading {file['name']}...")
+                    
                 request = self.service.files().get_media(fileId=file['id'])
                 fh = io.FileIO(local_path, 'wb')
                 downloader = MediaIoBaseDownload(fh, request)
@@ -282,9 +315,25 @@ class GoogleDriveSync(CloudSyncManager):
                 while not done:
                     status, done = downloader.next_chunk()
                     if verbose and status:
-                        print(f"Downloading {file['name']}: {int(status.progress() * 100)}%")
+                        print(f"  Progress: {int(status.progress() * 100)}%")
+                
+                # Update state after download with GDrive metadata
+                local_hash = self._file_hash(local_path)
+                self.state["files"][state_key] = {
+                    **stored_state,
+                    "hash": local_hash,
+                    "gdrive_md5": current_checksum,
+                    "gdrive_modified": file.get('modifiedTime'),
+                    "last_downloaded": datetime.now().isoformat()
+                }
                 
                 downloaded += 1
+            
+            # Save state after all downloads
+            self._save_state()
+            
+            if verbose:
+                print(f"\nSummary: Downloaded {downloaded}, Skipped {skipped} (unchanged)")
             
             return downloaded
         except Exception as e:
@@ -300,7 +349,7 @@ class GoogleDriveSync(CloudSyncManager):
         nsa_files = list(self.local_dir.glob("*.nsa"))
         
         if verbose:
-            print(f"Found {len(nsa_files)} .nsa files to process")
+            print(f"\nProcessing {len(nsa_files)} .nsa files for conversion")
         
         for nsa_file in nsa_files:
             # Get folder path from metadata
@@ -315,7 +364,7 @@ class GoogleDriveSync(CloudSyncManager):
             
             # Check if conversion is needed
             if self._needs_conversion(nsa_file, pdf_path):
-                if self.convert_file(nsa_file, pdf_path, verbose):
+                if self.convert_file(nsa_file, pdf_path, verbose, metadata):
                     converted += 1
         
         self.state["last_sync"] = datetime.now().isoformat()
