@@ -402,6 +402,55 @@ def draw_page_annotations(
             except Exception:
                 continue
 
+        # -------- stickers / emoji (annotationType=7) --------
+        # Check if rotationAngle column exists (newer NSA format)
+        has_rotation_angle = "rotationAngle" in cols
+        
+        if has_rotation_angle:
+            sticker_query = (
+                "SELECT emojiName, boundingRect_x, boundingRect_y, boundingRect_w, boundingRect_h, rotationAngle "
+                "FROM annotation WHERE annotationType=7"
+            )
+        else:
+            sticker_query = (
+                "SELECT emojiName, boundingRect_x, boundingRect_y, boundingRect_w, boundingRect_h, 0 as rotationAngle "
+                "FROM annotation WHERE annotationType=7"
+            )
+        
+        for emojiName, bx, by, bw, bh, rot in cur.execute(sticker_query):
+            if not emojiName or bw is None or bh is None:
+                continue
+
+            key = str(emojiName)
+            member = resource_index.get(key) or resource_index.get(key.lower())
+            if not member:
+                # sticker resource not embedded / not found
+                continue
+
+            try:
+                img_bytes = zf.read(member)
+            except Exception:
+                continue
+
+            x0 = float(bx or 0.0) * sx
+            y0 = float(by or 0.0) * sy
+            w  = float(bw) * sx
+            h  = float(bh) * sy
+            if w <= 0 or h <= 0:
+                continue
+
+            if invert_y:
+                y0 = out_page.rect.height - y0 - h
+
+            rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+            # NOTE: rot in your sample is always 0.
+            # If you later hit non-zero rotations, we can handle it (PyMuPDF supports rotate=90/180/270).
+            try:
+                out_page.insert_image(rect, stream=img_bytes)
+            except Exception:
+                continue
+
         # -------- ink strokes (annotationType=0) --------
         groups = defaultdict(list)  # (rgb,width,opacity) -> list[polyline]
 
@@ -500,7 +549,26 @@ def draw_page_annotations(
 
         con.close()
     finally:
-        os.unlink(temp_path)
+        # Close any remaining connections and allow Windows to release file lock
+        try:
+            if 'con' in locals():
+                con.close()
+        except:
+            pass
+        
+        # Small delay for Windows file lock release
+        import time
+        time.sleep(0.01)
+        
+        try:
+            os.unlink(temp_path)
+        except PermissionError:
+            # Windows sometimes keeps file locked briefly - retry once
+            time.sleep(0.1)
+            try:
+                os.unlink(temp_path)
+            except:
+                pass  # Give up, temp file will be cleaned eventually
 
 
 def nsa_to_pdf(
