@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DEFAULT_PATH = os.getenv("DEFAULT_PATH", r"./output")
+NO_CONFIRMATION = os.getenv("NO_CONFIRMATION", "0") == "1"
 class CloudSyncManager:
     """Base class for cloud storage sync managers"""
     
@@ -255,6 +256,60 @@ class GoogleDriveSync(CloudSyncManager):
         
         return folder_map
     
+    def _display_folder_structure(self, folder_map: Dict[str, str]) -> None:
+        """Display folder structure in a tree-like format"""
+        print("\n" + "="*60)
+        print("Google Drive Folder Structure:")
+        print("="*60)
+        
+        # Get unique folder paths and sort them
+        folder_paths = [path for path in folder_map.values() if path]
+        folder_paths.sort()
+        
+        if not folder_paths:
+            print("  (Root folder only)")
+        else:
+            # Build a tree structure
+            tree = {}
+            for path in folder_paths:
+                parts = path.split(os.sep)
+                current = tree
+                for part in parts:
+                    if part not in current:
+                        current[part] = {}
+                    current = current[part]
+            
+            # Display the tree
+            def print_tree(node, prefix="", is_last=True):
+                items = list(node.items())
+                for i, (name, children) in enumerate(items):
+                    is_last_item = (i == len(items) - 1)
+                    connector = "└── " if is_last_item else "├── "
+                    print(f"{prefix}{connector}{name}/")
+                    
+                    if children:
+                        extension = "    " if is_last_item else "│   "
+                        print_tree(children, prefix + extension, is_last_item)
+            
+            print_tree(tree)
+        
+        print("="*60)
+    
+    def _ask_confirmation(self) -> bool:
+        """Ask user for confirmation to proceed"""
+        if NO_CONFIRMATION:
+            return True
+        
+        while True:
+            print("\nDisable this prompt by setting NO_CONFIRMATION=1 in your environment variables.")
+            response = input("\nDo you want to proceed with syncing these folders? (yes/no): ").strip().lower()
+            if response in ['yes', 'y']:
+                return True
+            elif response in ['no', 'n']:
+                return False
+            else:
+                print("Please answer 'yes' or 'no'")
+    
     def download_files(self, verbose: bool = True) -> int:
         """Download .nsa files from Google Drive"""
         if not self.service:
@@ -274,6 +329,12 @@ class GoogleDriveSync(CloudSyncManager):
                     folder_map = self._get_all_folders_recursive(self.folder_id)
                     if verbose:
                         print(f"Found {len(folder_map)} folders to search")
+                        # Display folder structure
+                        self._display_folder_structure(folder_map)
+                        # Ask for confirmation
+                        if not self._ask_confirmation():
+                            print("Sync cancelled by user.")
+                            return 0
                 else:
                     folder_map = {self.folder_id: ""}
             
