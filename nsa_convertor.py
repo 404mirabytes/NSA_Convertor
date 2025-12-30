@@ -4,16 +4,16 @@
 """
 Noteshelf (Android) .nsa -> PDF (template + annotations) [best-effort]
 
-- .nsa je ZIP
-- Document.plist popisuje stránky (uuid, pdfKitPageRect, associatedPDFFileName, associatedPDFKitPageIndex...)
-- Templates/*.ns_pdf jsou normální PDF (podklad)
-- Annotations/<page_uuid> je SQLite s tabulkou "annotation"
-  - ink tahy: annotationType=0, blob ve stroke_segments_v3
-  - blob: segmentCount * 28 bytes; každý segment 7x float32 LE:
+- .nsa is a ZIP
+- Document.plist describes pages (uuid, pdfKitPageRect, associatedPDFFileName, associatedPDFKitPageIndex...)
+- Templates/*.ns_pdf are normal PDFs (background)
+- Annotations/<page_uuid> is SQLite with table "annotation"
+  - ink strokes: annotationType=0, blob in stroke_segments_v3
+  - blob: segmentCount * 28 bytes; each segment 7x float32 LE:
       x1,y1,x2,y2,?,pressure,?
-  - tvary: annotationType=5, JSON ve shape_data (controlPoints, strokeOpacity, properties.strokeThickness, ...)
+  - tvary: annotationType=5, JSON in shape_data (controlPoints, strokeOpacity, properties.strokeThickness, ...)
 
-Cíl: vyrobit "flattened" PDF podobné Noteshelf exportu.
+Goal: produce a "flattened" PDF similar to Noteshelf export.
 """
 
 from __future__ import annotations
@@ -688,14 +688,14 @@ def main() -> None:
     ap.add_argument("--quiet", action="store_true", help="Méně výpisů")
 
     ap.add_argument("--highlighter-opacity", type=float, default=0.38,
-                    help="Průhlednost zvýrazňovače (0..1). Default 0.38")
+                    help="Opacity of the highlighter (0..1). Default 0.38")
     ap.add_argument("--highlighter-ratio", type=float, default=5.0,
-                    help="Jak moc má být zvýrazňovač tlustší než pero (poměr). Default 5.0")
+                    help="How much thicker the highlighter should be compared to the pen (ratio). Default 5.0")
 
     ap.add_argument("--no-smooth", action="store_true",
-                    help="Vypnout vyhlazení (RDP).")
+                    help="Disable smoothing (RDP).")
     ap.add_argument("--epsilon", type=float, default=0.8,
-                    help="RDP epsilon (větší = hladší, menší = přesnější). Default 0.8")
+                    help="RDP epsilon (greater = smoother, smaller = more precise). Default 0.8")
 
     args = ap.parse_args()
     verbose = not args.quiet
@@ -709,7 +709,7 @@ def main() -> None:
 
         nsa_files = [f for f in os.listdir(in_path) if f.lower().endswith(".nsa")]
         if not nsa_files:
-            raise SystemExit("Ve složce nejsou žádné .nsa soubory.")
+            raise SystemExit("No .nsa files found in the directory  .")
 
         for f in sorted(nsa_files):
             src = os.path.join(in_path, f)
@@ -730,7 +730,7 @@ def main() -> None:
         return
 
     if not in_path.lower().endswith(".nsa"):
-        raise SystemExit("Input není .nsa soubor (ani složka).")
+        raise SystemExit("Input is not a .nsa file (or directory).")
 
     out_pdf = args.output
     if not out_pdf:
