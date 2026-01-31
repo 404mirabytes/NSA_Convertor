@@ -105,6 +105,51 @@ def rdp(points: List[Tuple[float, float]], epsilon: float) -> List[Tuple[float, 
     return left[:-1] + right
 
 
+def catmull_rom_spline(points: List[Tuple[float, float]], samples_per_segment: int) -> List[Tuple[float, float]]:
+    """Simple Catmull-Rom spline through points (uniform parameterization)."""
+    if len(points) < 2 or samples_per_segment <= 1:
+        return points
+    if len(points) < 4:
+        # Linear upsample for short strokes
+        out: List[Tuple[float, float]] = []
+        for i in range(len(points) - 1):
+            x1, y1 = points[i]
+            x2, y2 = points[i + 1]
+            for s in range(samples_per_segment):
+                t = s / float(samples_per_segment)
+                out.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t))
+        out.append(points[-1])
+        return out
+
+    out: List[Tuple[float, float]] = []
+    n = len(points)
+    for i in range(n - 1):
+        p0 = points[i - 1] if i - 1 >= 0 else points[i]
+        p1 = points[i]
+        p2 = points[i + 1]
+        p3 = points[i + 2] if i + 2 < n else points[i + 1]
+
+        for s in range(samples_per_segment):
+            t = s / float(samples_per_segment)
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * (
+                (2 * p1[0]) +
+                (-p0[0] + p2[0]) * t +
+                (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1]) +
+                (-p0[1] + p2[1]) * t +
+                (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            out.append((x, y))
+    out.append(points[-1])
+    return out
+
+
 def rgb_from_int(color_int: int) -> Tuple[float, float, float]:
     """0xRRGGBB -> (r,g,b) in 0..1"""
     r = (color_int >> 16) & 0xFF
@@ -339,6 +384,8 @@ def draw_page_annotations(
     hl_width_mults: Dict[int, float],
     smooth: bool,
     epsilon: float,
+    curve: bool,
+    curve_samples: int,
 ) -> None:
     ann_bytes = zf.read(ann_member)
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tf:
@@ -477,7 +524,9 @@ def draw_page_annotations(
                     Y = out_page.rect.height - Y
                 pts_scaled.append((X, Y))
 
-            if smooth and len(pts_scaled) > 3:
+            if curve and len(pts_scaled) > 3:
+                pts_scaled = catmull_rom_spline(pts_scaled, curve_samples)
+            elif smooth and len(pts_scaled) > 3:
                 pts_scaled = rdp(pts_scaled, epsilon)
 
             col = int(strokeColor) if strokeColor is not None else 0
@@ -579,6 +628,8 @@ def nsa_to_pdf(
     highlighter_opacity: float = 0.38,
     smooth: bool = True,
     epsilon: float = 0.8,
+    curve: bool = False,
+    curve_samples: int = 8,
     verbose: bool = True,
 ) -> None:
     if verbose:
@@ -659,6 +710,8 @@ def nsa_to_pdf(
                     hl_width_mults=hl_mults,
                     smooth=smooth,
                     epsilon=epsilon,
+                    curve=curve,
+                    curve_samples=curve_samples,
                 )
 
             if verbose and i % 10 == 0:
@@ -696,6 +749,10 @@ def main() -> None:
                     help="Disable smoothing (RDP).")
     ap.add_argument("--epsilon", type=float, default=0.8,
                     help="RDP epsilon (greater = smoother, smaller = more precise). Default 0.8")
+    ap.add_argument("--curve", action="store_true",
+                    help="Use Catmull-Rom spline upsampling instead of RDP.")
+    ap.add_argument("--curve-samples", type=int, default=8,
+                    help="Samples per segment for --curve. Default 8.")
 
     args = ap.parse_args()
     verbose = not args.quiet
@@ -722,6 +779,8 @@ def main() -> None:
                 highlighter_opacity=args.highlighter_opacity,
                 smooth=smooth,
                 epsilon=args.epsilon,
+                curve=args.curve,
+                curve_samples=args.curve_samples,
                 verbose=verbose,
             )
 
@@ -743,6 +802,8 @@ def main() -> None:
         highlighter_opacity=args.highlighter_opacity,
         smooth=smooth,
         epsilon=args.epsilon,
+        curve=args.curve,
+        curve_samples=args.curve_samples,
         verbose=verbose,
     )
 
