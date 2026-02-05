@@ -34,6 +34,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import fitz  # PyMuPDF
 
+DEFAULT_CURVE_SAMPLES = 4
+MIN_CURVE_SAMPLES = 2
+MAX_CURVE_SAMPLES = 8
+PRESSURE_WIDTH_QUANT = 0.2
+SHAPE_DEDUP_TOL = 1.0
 
 # -----------------------------
 # Helpers
@@ -69,6 +74,68 @@ def extract_points_from_blob(blob: bytes) -> List[Tuple[float, float]]:
     for x1, y1, x2, y2, *_ in it:
         pts.append((x2, y2))
     return pts
+
+
+def extract_segments_from_blob(blob: bytes) -> List[Tuple[float, float, float, float, float]]:
+    """
+    stroke_segments_v3: 7 float32 per segment (28 bytes).
+    Returns list of (x1, y1, x2, y2, size) where size is the 5th float.
+    """
+    if not blob or len(blob) < 28:
+        return []
+    if len(blob) % 28 != 0:
+        blob = blob[: len(blob) - (len(blob) % 28)]
+        if not blob:
+            return []
+    segments: List[Tuple[float, float, float, float, float]] = []
+    for x1, y1, x2, y2, size, _pressure, _flag in struct.iter_unpack("<7f", blob):
+        segments.append((x1, y1, x2, y2, size))
+    return segments
+
+
+def bbox_key(color: int, bx: float, by: float, bw: float, bh: float, tol: float = SHAPE_DEDUP_TOL) -> Tuple[int, float, float, float, float]:
+    if tol <= 0:
+        return (color, bx, by, bw, bh)
+    q = lambda v: round(v / tol) * tol
+    return (color, q(bx), q(by), q(bw), q(bh))
+
+
+def quantize_width(width: float, step: float = PRESSURE_WIDTH_QUANT) -> float:
+    if step <= 0:
+        return width
+    return round(width / step) * step
+
+
+def polyline_length(points: List[Tuple[float, float]]) -> float:
+    if len(points) < 2:
+        return 0.0
+    total = 0.0
+    for i in range(1, len(points)):
+        x0, y0 = points[i - 1]
+        x1, y1 = points[i]
+        dx = x1 - x0
+        dy = y1 - y0
+        total += (dx * dx + dy * dy) ** 0.5
+    return total
+
+
+def adaptive_curve_samples(points: List[Tuple[float, float]], base: int = DEFAULT_CURVE_SAMPLES) -> int:
+    length = polyline_length(points)
+    if length < 200:
+        samples = base - 2
+    elif length < 800:
+        samples = base - 1
+    elif length < 2000:
+        samples = base
+    elif length < 4000:
+        samples = base + 1
+    else:
+        samples = base + 2
+    if samples < MIN_CURVE_SAMPLES:
+        return MIN_CURVE_SAMPLES
+    if samples > MAX_CURVE_SAMPLES:
+        return MAX_CURVE_SAMPLES
+    return samples
 
 
 def rdp(points: List[Tuple[float, float]], epsilon: float) -> List[Tuple[float, float]]:
@@ -148,6 +215,152 @@ def catmull_rom_spline(points: List[Tuple[float, float]], samples_per_segment: i
             out.append((x, y))
     out.append(points[-1])
     return out
+
+
+def catmull_rom_spline_with_widths(
+    points: List[Tuple[float, float]],
+    widths: List[float],
+    samples_per_segment: int,
+) -> List[Tuple[float, float, float]]:
+    """Catmull-Rom spline through points with interpolated widths."""
+    if len(points) < 2 or samples_per_segment <= 1 or len(points) != len(widths):
+        return [(x, y, w) for (x, y), w in zip(points, widths)]
+    if len(points) < 4:
+        out: List[Tuple[float, float, float]] = []
+        for i in range(len(points) - 1):
+            x1, y1 = points[i]
+            x2, y2 = points[i + 1]
+            w1 = widths[i]
+            w2 = widths[i + 1]
+            for s in range(samples_per_segment):
+                t = s / float(samples_per_segment)
+                out.append((x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, w1 + (w2 - w1) * t))
+        out.append((points[-1][0], points[-1][1], widths[-1]))
+        return out
+
+    out: List[Tuple[float, float, float]] = []
+    n = len(points)
+    for i in range(n - 1):
+        p0 = points[i - 1] if i - 1 >= 0 else points[i]
+        p1 = points[i]
+        p2 = points[i + 1]
+        p3 = points[i + 2] if i + 2 < n else points[i + 1]
+
+        w0 = widths[i - 1] if i - 1 >= 0 else widths[i]
+        w1 = widths[i]
+        w2 = widths[i + 1]
+        w3 = widths[i + 2] if i + 2 < n else widths[i + 1]
+
+        for s in range(samples_per_segment):
+            t = s / float(samples_per_segment)
+            t2 = t * t
+            t3 = t2 * t
+            x = 0.5 * (
+                (2 * p1[0]) +
+                (-p0[0] + p2[0]) * t +
+                (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3
+            )
+            y = 0.5 * (
+                (2 * p1[1]) +
+                (-p0[1] + p2[1]) * t +
+                (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3
+            )
+            w = 0.5 * (
+                (2 * w1) +
+                (-w0 + w2) * t +
+                (2 * w0 - 5 * w1 + 4 * w2 - w3) * t2 +
+                (-w0 + 3 * w1 - 3 * w2 + w3) * t3
+            )
+            out.append((x, y, w))
+    out.append((points[-1][0], points[-1][1], widths[-1]))
+    return out
+
+
+def segments_to_polylines(
+    segments: List[Tuple[float, float, float, float, float]],
+    *,
+    jump_ratio: float = 4.0,
+    min_jump: float = 10.0,
+) -> List[List[Tuple[float, float]]]:
+    """
+    Convert segment list to polylines, splitting when the next segment's start
+    is far from the previous segment's end.
+    """
+    if not segments:
+        return []
+
+    seg_lens: List[float] = []
+    for x1, y1, x2, y2, _size in segments:
+        seg_lens.append(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+
+    med = median(seg_lens) if seg_lens else 0.0
+    threshold = max(min_jump, med * jump_ratio) if med > 0 else min_jump
+
+    polylines: List[List[Tuple[float, float]]] = []
+    cur: List[Tuple[float, float]] = []
+    prev_x2 = prev_y2 = None
+
+    for x1, y1, x2, y2, _size in segments:
+        if prev_x2 is not None:
+            jump = ((x1 - prev_x2) ** 2 + (y1 - prev_y2) ** 2) ** 0.5
+            if jump > threshold and len(cur) >= 2:
+                polylines.append(cur)
+                cur = []
+
+        if not cur:
+            cur.append((x1, y1))
+        cur.append((x2, y2))
+        prev_x2, prev_y2 = x2, y2
+
+    if len(cur) >= 2:
+        polylines.append(cur)
+
+    return polylines
+
+
+def segments_to_polylines_with_sizes(
+    segments: List[Tuple[float, float, float, float, float]],
+    *,
+    jump_ratio: float = 4.0,
+    min_jump: float = 10.0,
+) -> List[Tuple[List[Tuple[float, float]], List[float]]]:
+    """Convert segments to polylines with per-point sizes, splitting on large jumps."""
+    if not segments:
+        return []
+
+    seg_lens: List[float] = []
+    for x1, y1, x2, y2, _size in segments:
+        seg_lens.append(((x2 - x1) ** 2 + (y2 - y1) ** 2) ** 0.5)
+
+    med = median(seg_lens) if seg_lens else 0.0
+    threshold = max(min_jump, med * jump_ratio) if med > 0 else min_jump
+
+    polylines: List[Tuple[List[Tuple[float, float]], List[float]]] = []
+    cur_pts: List[Tuple[float, float]] = []
+    cur_sizes: List[float] = []
+    prev_x2 = prev_y2 = None
+
+    for x1, y1, x2, y2, size in segments:
+        if prev_x2 is not None:
+            jump = ((x1 - prev_x2) ** 2 + (y1 - prev_y2) ** 2) ** 0.5
+            if jump > threshold and len(cur_pts) >= 2:
+                polylines.append((cur_pts, cur_sizes))
+                cur_pts = []
+                cur_sizes = []
+
+        if not cur_pts:
+            cur_pts.append((x1, y1))
+            cur_sizes.append(size)
+        cur_pts.append((x2, y2))
+        cur_sizes.append(size)
+        prev_x2, prev_y2 = x2, y2
+
+    if len(cur_pts) >= 2:
+        polylines.append((cur_pts, cur_sizes))
+
+    return polylines
 
 
 def rgb_from_int(color_int: int) -> Tuple[float, float, float]:
@@ -385,7 +598,7 @@ def draw_page_annotations(
     smooth: bool,
     epsilon: float,
     curve: bool,
-    curve_samples: int,
+    use_pressure: bool,
 ) -> None:
     ann_bytes = zf.read(ann_member)
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tf:
@@ -411,6 +624,17 @@ def draw_page_annotations(
                 break
 
         invert_y = choose_invert_y(sample_pts, out_page.rect.width, out_page.rect.height, sx, sy)
+
+        ink_bbox_keys: set = set()
+        for c, bx, by, bw, bh in cur.execute(
+            "SELECT strokeColor, boundingRect_x, boundingRect_y, boundingRect_w, boundingRect_h "
+            "FROM annotation WHERE annotationType=0"
+        ):
+            if bw is None or bh is None:
+                continue
+            col = int(c) if c is not None else 0
+            key = bbox_key(col, float(bx or 0.0), float(by or 0.0), float(bw), float(bh))
+            ink_bbox_keys.add(key)
 
         # -------- images (annotationType=2) --------
         for img_id, bx, by, bw, bh, _img_tx, _tx in cur.execute(
@@ -500,6 +724,7 @@ def draw_page_annotations(
 
         # -------- ink strokes (annotationType=0) --------
         groups = defaultdict(list)  # (rgb,width,opacity) -> list[polyline]
+        seg_groups = defaultdict(list)  # (rgb,width,opacity) -> list[((x1,y1),(x2,y2))]
 
         if has_pen_type:
             q = "SELECT strokeWidth, strokeColor, penType, stroke_segments_v3 FROM annotation WHERE annotationType=0"
@@ -507,43 +732,80 @@ def draw_page_annotations(
             q = "SELECT strokeWidth, strokeColor, 0 as penType, stroke_segments_v3 FROM annotation WHERE annotationType=0"
 
         for strokeWidth, strokeColor, penType, blob in cur.execute(q):
-            pts = extract_points_from_blob(blob)
-            if len(pts) < 2:
+            segments = extract_segments_from_blob(blob)
+            if len(segments) < 1:
                 continue
 
-            # hodně dlouhé tahy zřeď (kvůli velikosti PDF)
-            if len(pts) > 5000:
-                step = max(1, len(pts) // 1600)
-                pts = pts[::step]
+            # hodn?? dlouh?? tahy z??e?? (kv??li velikosti PDF)
+            if len(segments) > 5000:
+                step = max(1, len(segments) // 1600)
+                segments = segments[::step]
 
-            pts_scaled: List[Tuple[float, float]] = []
-            for x, y in pts:
-                X = x * sx
-                Y = y * sy
+            seg_scaled: List[Tuple[float, float, float, float, float]] = []
+            for x1, y1, x2, y2, size in segments:
+                X1 = x1 * sx
+                Y1 = y1 * sy
+                X2 = x2 * sx
+                Y2 = y2 * sy
                 if invert_y:
-                    Y = out_page.rect.height - Y
-                pts_scaled.append((X, Y))
-
-            if curve and len(pts_scaled) > 3:
-                pts_scaled = catmull_rom_spline(pts_scaled, curve_samples)
-            elif smooth and len(pts_scaled) > 3:
-                pts_scaled = rdp(pts_scaled, epsilon)
+                    Y1 = out_page.rect.height - Y1
+                    Y2 = out_page.rect.height - Y2
+                seg_scaled.append((X1, Y1, X2, Y2, float(size)))
 
             col = int(strokeColor) if strokeColor is not None else 0
             rgb = rgb_from_int(col)
 
             w = float(strokeWidth) if strokeWidth is not None else 1.0
-            width = w * sx  # základní převod do PDF bodů
+            width_base = w * sx  # základní převod do PDF bodů
 
             pt = int(penType) if penType is not None else 0
             opacity = 1.0
 
             if pt in highlighter_types:
                 opacity = highlighter_opacity
-                width *= hl_width_mults.get(pt, 4.0)
+                width_base *= hl_width_mults.get(pt, 4.0)
 
-            key = (rgb, round(width, 3), round(opacity, 3))
-            groups[key].append(pts_scaled)
+            if use_pressure:
+                sizes = [s for *_, s in seg_scaled if s > 0]
+                med_size = median(sizes) if sizes else 0.0
+                if curve:
+                    polys = segments_to_polylines_with_sizes(seg_scaled)
+                    for pts, szs in polys:
+                        if len(pts) < 2 or len(pts) != len(szs):
+                            continue
+                        samples = catmull_rom_spline_with_widths(pts, szs, adaptive_curve_samples(pts))
+                        for i in range(len(samples) - 1):
+                            x1, y1, w1 = samples[i]
+                            x2, y2, w2 = samples[i + 1]
+                            size = (w1 + w2) / 2.0
+                            if size < 0.0:
+                                size = 0.0
+                            ratio = (size / med_size) if med_size > 0 else 1.0
+                            ratio = max(0.25, min(3.0, ratio))
+                            width = quantize_width(width_base * ratio)
+                            key = (rgb, round(width, 3), round(opacity, 3))
+                            seg_groups[key].append(((x1, y1), (x2, y2)))
+                else:
+                    for x1, y1, x2, y2, size in seg_scaled:
+                        ratio = (size / med_size) if med_size > 0 else 1.0
+                        ratio = max(0.25, min(3.0, ratio))
+                        width = width_base * ratio
+                        key = (rgb, round(width, 3), round(opacity, 3))
+                        seg_groups[key].append(((x1, y1), (x2, y2)))
+            else:
+                polylines = segments_to_polylines(seg_scaled)
+                refined: List[List[Tuple[float, float]]] = []
+                for poly in polylines:
+                    if curve and len(poly) > 3:
+                        poly = catmull_rom_spline(poly, adaptive_curve_samples(poly))
+                    elif smooth and len(poly) > 3:
+                        poly = rdp(poly, epsilon)
+                    if len(poly) >= 2:
+                        refined.append(poly)
+
+                key = (rgb, round(width_base, 3), round(opacity, 3))
+                for poly in refined:
+                    groups[key].append(poly)
 
         for (rgb, width, opacity), polylines in groups.items():
             sh = out_page.new_shape()
@@ -552,10 +814,18 @@ def draw_page_annotations(
             sh.finish(width=float(width), color=rgb, stroke_opacity=float(opacity))
             sh.commit()
 
+        for (rgb, width, opacity), segments in seg_groups.items():
+            sh = out_page.new_shape()
+            for p1, p2 in segments:
+                sh.draw_line(p1, p2)
+            sh.finish(width=float(width), color=rgb, stroke_opacity=float(opacity))
+            sh.commit()
+
         # -------- shapes (annotationType=5) --------
         shape_groups = defaultdict(list)  # (rgb,width,opacity,closed) -> list[polyline]
-        for strokeColor, strokeWidth, shape_data in cur.execute(
-            "SELECT strokeColor, strokeWidth, shape_data FROM annotation WHERE annotationType=5"
+        for strokeColor, strokeWidth, shape_data, bx, by, bw, bh in cur.execute(
+            "SELECT strokeColor, strokeWidth, shape_data, boundingRect_x, boundingRect_y, boundingRect_w, boundingRect_h "
+            "FROM annotation WHERE annotationType=5"
         ):
             if not shape_data:
                 continue
@@ -567,6 +837,12 @@ def draw_page_annotations(
             pts = sd.get("controlPoints") or []
             if len(pts) < 2:
                 continue
+
+            if bw is not None and bh is not None:
+                col = int(strokeColor) if strokeColor is not None else 0
+                key = bbox_key(col, float(bx or 0.0), float(by or 0.0), float(bw), float(bh))
+                if key in ink_bbox_keys:
+                    continue
 
             pts_scaled: List[Tuple[float, float]] = []
             for x, y in pts:
@@ -628,8 +904,8 @@ def nsa_to_pdf(
     highlighter_opacity: float = 0.38,
     smooth: bool = True,
     epsilon: float = 0.8,
-    curve: bool = False,
-    curve_samples: int = 8,
+    curve: bool = True,
+    use_pressure: bool = True,
     verbose: bool = True,
 ) -> None:
     if verbose:
@@ -711,7 +987,7 @@ def nsa_to_pdf(
                     smooth=smooth,
                     epsilon=epsilon,
                     curve=curve,
-                    curve_samples=curve_samples,
+                    use_pressure=use_pressure,
                 )
 
             if verbose and i % 10 == 0:
@@ -747,12 +1023,16 @@ def main() -> None:
 
     ap.add_argument("--no-smooth", action="store_true",
                     help="Disable smoothing (RDP).")
+    ap.add_argument("--curve", action="store_true", default=True,
+                    help="Use Catmull-Rom spline upsampling instead of RDP (default on).")
+    ap.add_argument("--no-curve", action="store_false", dest="curve",
+                    help="Disable curve smoothing (use RDP if enabled).")
     ap.add_argument("--epsilon", type=float, default=0.8,
                     help="RDP epsilon (greater = smoother, smaller = more precise). Default 0.8")
-    ap.add_argument("--curve", action="store_true",
-                    help="Use Catmull-Rom spline upsampling instead of RDP.")
-    ap.add_argument("--curve-samples", type=int, default=8,
-                    help="Samples per segment for --curve. Default 8.")
+    ap.add_argument("--pressure", action="store_true", default=True,
+                    help="Use per-segment width from stroke data (variable width). Works with --curve (default on).")
+    ap.add_argument("--no-pressure", action="store_false", dest="pressure",
+                    help="Disable variable width (pressure).")
 
     args = ap.parse_args()
     verbose = not args.quiet
@@ -780,7 +1060,7 @@ def main() -> None:
                 smooth=smooth,
                 epsilon=args.epsilon,
                 curve=args.curve,
-                curve_samples=args.curve_samples,
+                use_pressure=args.pressure,
                 verbose=verbose,
             )
 
@@ -803,7 +1083,7 @@ def main() -> None:
         smooth=smooth,
         epsilon=args.epsilon,
         curve=args.curve,
-        curve_samples=args.curve_samples,
+        use_pressure=args.pressure,
         verbose=verbose,
     )
 
