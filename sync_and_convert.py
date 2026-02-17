@@ -378,6 +378,9 @@ class GoogleDriveSync(CloudSyncManager):
                 folder_path = ""
                 if 'parents' in file and file['parents']:
                     parent_id = file['parents'][0]  # Use first parent
+                    # Skip files not in our target folder tree
+                    if parent_id not in folder_map:
+                        continue
                     folder_path = folder_map.get(parent_id, "")
                 
                 # Mirror folder structure locally to avoid name collisions
@@ -472,9 +475,10 @@ class GoogleDriveSync(CloudSyncManager):
         """Download and convert files"""
         downloaded = self.download_files(verbose)
         
-        # Convert files with folder structure
+        # Convert only files that were downloaded from the target folder
+        # (those in file_metadata, not all files in local_dir)
         converted = 0
-        nsa_files = list(self.local_dir.rglob("*.nsa"))
+        nsa_files = [Path(p) for p in self.file_metadata.keys()]
         
         if verbose:
             print(f"\nProcessing {len(nsa_files)} .nsa files for conversion")
