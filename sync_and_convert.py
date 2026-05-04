@@ -12,6 +12,7 @@ import time
 import argparse
 import hashlib
 import json
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
@@ -25,13 +26,55 @@ load_dotenv()
 
 DEFAULT_PATH = os.getenv("DEFAULT_PATH", r"./output")
 NO_CONFIRMATION = os.getenv("NO_CONFIRMATION", "0") == "1"
+NOTEIN_EXTENSIONS = {".notein", ".zip"}
+NOTEIN_ZIP_MIME_TYPES = {
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+}
+
+
+def output_stem_for_source(source_file: Path, notein: bool = False) -> str:
+    if notein and source_file.suffix.lower() == ".zip" and source_file.stem.lower().endswith(".notein"):
+        return Path(source_file.stem).stem
+    return source_file.stem
+
+
+def is_notein_bundle(path: Path) -> bool:
+    if not path.is_file() or not zipfile.is_zipfile(path):
+        return False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            return any(
+                Path(name).name.startswith("note_database")
+                and Path(name).name.endswith("_db")
+                for name in zf.namelist()
+            )
+    except Exception:
+        return False
+
+
+def is_notein_drive_candidate(file: dict) -> bool:
+    name = file.get("name", "")
+    lower_name = name.lower()
+    suffix = Path(name).suffix.lower()
+    if lower_name.endswith(".nsa"):
+        return False
+    if suffix in NOTEIN_EXTENSIONS or lower_name.endswith(".notein.zip"):
+        return True
+    return "." not in name and file.get("mimeType") in NOTEIN_ZIP_MIME_TYPES
+
+
 class CloudSyncManager:
     """Base class for cloud storage sync managers"""
     
-    def __init__(self, local_dir: str, output_dir: str, state_file: str = "sync_state.json"):
+    def __init__(self, local_dir: str, output_dir: str, state_file: str = "sync_state.json", notein: bool = False):
         self.local_dir = Path(local_dir)
         self.output_dir = Path(output_dir)
         self.state_file = Path(state_file)
+        self.notein = notein
+        self.file_label = "Notein" if notein else "NSA"
+        self.source_extension = "Notein bundles" if notein else ".nsa files"
         self.state = self._load_state()
         
         # Create directories if they don't exist
@@ -72,12 +115,12 @@ class CloudSyncManager:
                 hash_md5.update(chunk)
         return hash_md5.hexdigest()
     
-    def _needs_conversion(self, nsa_file: Path, pdf_path: Optional[Path] = None) -> bool:
-        """Check if NSA file needs conversion"""
+    def _needs_conversion(self, source_file: Path, pdf_path: Optional[Path] = None) -> bool:
+        """Check if source file needs conversion"""
         # Normalize path for consistent state keys
-        file_key = str(nsa_file.resolve())
+        file_key = str(source_file.resolve())
         if pdf_path is None:
-            pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+            pdf_file = self.output_dir / (output_stem_for_source(source_file, self.notein) + ".pdf")
         else:
             pdf_file = pdf_path
         
@@ -86,19 +129,20 @@ class CloudSyncManager:
             return True
         
         # Convert if file hash changed since last conversion
-        current_hash = self._file_hash(nsa_file)
+        current_hash = self._file_hash(source_file)
         converted_hash = self.state["files"].get(file_key, {}).get("converted_hash")
         
         return current_hash != converted_hash
     
-    def convert_file(self, nsa_file: Path, pdf_path: Optional[Path] = None, verbose: bool = True, metadata: dict = None) -> bool:
-        """Convert single NSA file to PDF"""
+    def convert_file(self, source_file: Path, pdf_path: Optional[Path] = None, verbose: bool = True, metadata: dict = None) -> bool:
+        """Convert single source file to PDF"""
+        nsa_file = source_file
         try:
             if metadata is None:
                 metadata = {}
                 
             if pdf_path is None:
-                pdf_file = self.output_dir / (nsa_file.stem + ".pdf")
+                pdf_file = self.output_dir / (output_stem_for_source(source_file, self.notein) + ".pdf")
             else:
                 pdf_file = pdf_path
             
@@ -106,17 +150,22 @@ class CloudSyncManager:
             pdf_file.parent.mkdir(parents=True, exist_ok=True)
             
             if verbose:
-                print(f"Converting: {nsa_file.name}")
+                print(f"Converting: {source_file.name}")
             
-            nsa_to_pdf(
-                str(nsa_file), 
-                str(pdf_file), 
-                verbose=False,  # Don't show conversion details to avoid clutter
-                desired_highlighter_ratio=5.0,
-                highlighter_opacity=0.35,
-                smooth=True,
-                epsilon=0.8
-            )
+            if self.notein:
+                from notein_extract import notein_to_pdf
+
+                notein_to_pdf(source_file, pdf_file, verbose=False)
+            else:
+                nsa_to_pdf(
+                    str(source_file),
+                    str(pdf_file),
+                    verbose=False,  # Don't show conversion details to avoid clutter
+                    desired_highlighter_ratio=5.0,
+                    highlighter_opacity=0.35,
+                    smooth=True,
+                    epsilon=0.8
+                )
             
             if verbose:
                 # Show relative path from output_dir
@@ -127,8 +176,8 @@ class CloudSyncManager:
                     print(f"  ✓ Saved to: {pdf_file.name}")
             
             # Update state - track conversion hash separately
-            file_key = str(nsa_file.resolve())
-            current_hash = self._file_hash(nsa_file)
+            file_key = str(source_file.resolve())
+            current_hash = self._file_hash(source_file)
             existing_state = self.state["files"].get(file_key, {})
             
             self.state["files"][file_key] = {
@@ -150,20 +199,26 @@ class CloudSyncManager:
             return False
     
     def sync_local_files(self, verbose: bool = True) -> int:
-        """Process all .nsa files in local directory recursively"""
+        """Process all source files in local directory recursively"""
         converted = 0
-        nsa_files = list(self.local_dir.rglob("*.nsa"))
+        if self.notein:
+            nsa_files = [
+                path for path in self.local_dir.rglob("*")
+                if path.is_file() and is_notein_bundle(path)
+            ]
+        else:
+            nsa_files = list(self.local_dir.rglob("*.nsa"))
         
         if verbose:
-            print(f"Found {len(nsa_files)} .nsa files in {self.local_dir}")
+            print(f"Found {len(nsa_files)} {self.source_extension} in {self.local_dir}")
         
         for nsa_file in nsa_files:
             # Mirror folder structure in output
             try:
                 rel_path = nsa_file.relative_to(self.local_dir)
-                pdf_path = self.output_dir / rel_path.parent / (nsa_file.stem + ".pdf")
+                pdf_path = self.output_dir / rel_path.parent / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
             except ValueError:
-                pdf_path = self.output_dir / (nsa_file.stem + ".pdf")
+                pdf_path = self.output_dir / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
             
             if self._needs_conversion(nsa_file, pdf_path):
                 if self.convert_file(nsa_file, pdf_path, verbose=verbose):
@@ -178,8 +233,15 @@ class CloudSyncManager:
 class GoogleDriveSync(CloudSyncManager):
     """Google Drive sync implementation"""
     
-    def __init__(self, local_dir: str, output_dir: str, folder_id: Optional[str] = None, recursive: bool = True):
-        super().__init__(local_dir, output_dir)
+    def __init__(
+        self,
+        local_dir: str,
+        output_dir: str,
+        folder_id: Optional[str] = None,
+        recursive: bool = True,
+        notein: bool = False,
+    ):
+        super().__init__(local_dir, output_dir, notein=notein)
         self.folder_id = folder_id
         self.recursive = recursive
         self.service = None
@@ -311,7 +373,7 @@ class GoogleDriveSync(CloudSyncManager):
                 print("Please answer 'yes' or 'no'")
     
     def download_files(self, verbose: bool = True) -> int:
-        """Download .nsa files from Google Drive"""
+        """Download source files from Google Drive"""
         if not self.service:
             if not self.authenticate():
                 return 0
@@ -338,7 +400,7 @@ class GoogleDriveSync(CloudSyncManager):
                 else:
                     folder_map = {self.folder_id: ""}
             
-            # Query for .nsa files with pagination
+            # Query for source files with pagination
             if folder_map:
                 # Build query for multiple folders
                 folder_ids = list(folder_map.keys())
@@ -354,13 +416,16 @@ class GoogleDriveSync(CloudSyncManager):
             while True:
                 results = self.service.files().list(
                     q=query,
-                    fields="nextPageToken, files(id, name, modifiedTime, md5Checksum, parents)",
+                    fields="nextPageToken, files(id, name, mimeType, modifiedTime, md5Checksum, parents)",
                     pageSize=1000,
                     pageToken=page_token
                 ).execute()
                 
-                # Filter for .nsa files (case-insensitive, exact)
-                batch_files = [f for f in results.get('files', []) if f['name'].lower().endswith('.nsa')]
+                if self.notein:
+                    batch_files = [f for f in results.get('files', []) if is_notein_drive_candidate(f)]
+                else:
+                    # Filter for .nsa files (case-insensitive, exact)
+                    batch_files = [f for f in results.get('files', []) if f['name'].lower().endswith('.nsa')]
                 files.extend(batch_files)
                 
                 page_token = results.get('nextPageToken')
@@ -371,7 +436,7 @@ class GoogleDriveSync(CloudSyncManager):
             skipped = 0
             
             if verbose:
-                print(f"Found {len(files)} .nsa files on Google Drive")
+                print(f"Found {len(files)} {self.source_extension} on Google Drive")
             
             for file in files:
                 # Determine folder path for this file
@@ -479,9 +544,11 @@ class GoogleDriveSync(CloudSyncManager):
         # (those in file_metadata, not all files in local_dir)
         converted = 0
         nsa_files = [Path(p) for p in self.file_metadata.keys()]
+        if self.notein:
+            nsa_files = [path for path in nsa_files if is_notein_bundle(path)]
         
         if verbose:
-            print(f"\nProcessing {len(nsa_files)} .nsa files for conversion")
+            print(f"\nProcessing {len(nsa_files)} {self.source_extension} for conversion")
         
         for nsa_file in nsa_files:
             # Get folder path from metadata using resolved path
@@ -491,9 +558,9 @@ class GoogleDriveSync(CloudSyncManager):
             
             # Construct PDF output path with folder structure
             if folder_path:
-                pdf_path = self.output_dir / folder_path / (nsa_file.stem + ".pdf")
+                pdf_path = self.output_dir / folder_path / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
             else:
-                pdf_path = self.output_dir / (nsa_file.stem + ".pdf")
+                pdf_path = self.output_dir / (output_stem_for_source(nsa_file, self.notein) + ".pdf")
             
             # Check if conversion is needed
             if self._needs_conversion(nsa_file, pdf_path):
@@ -508,7 +575,7 @@ class GoogleDriveSync(CloudSyncManager):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Sync Noteshelf .nsa files from cloud storage and convert to PDF"
+        description="Sync Noteshelf .nsa files or Notein bundles from cloud storage and convert to PDF"
     )
     parser.add_argument(
         "--provider",
@@ -518,8 +585,8 @@ def main():
     )
     parser.add_argument(
         "--local-dir",
-        default="./nsa_files",
-        help="Local directory for .nsa files"
+        default=None,
+        help="Local directory for synced source files (default: ./nsa_files, or ./notein_files with --notein)"
     )
     parser.add_argument(
         "--output-dir",
@@ -551,8 +618,15 @@ def main():
         action="store_true",
         help="Suppress output"
     )
+    parser.add_argument(
+        "--notein",
+        action="store_true",
+        help="Sync and convert Notein export bundles instead of Noteshelf .nsa files"
+    )
     
     args = parser.parse_args()
+    if args.local_dir is None:
+        args.local_dir = "./notein_files" if args.notein else "./nsa_files"
     verbose = not args.quiet
     
     # Validate provider
@@ -564,9 +638,9 @@ def main():
     # Initialize sync manager based on provider
     if args.provider == "gdrive":
         recursive = not args.no_recursive
-        manager = GoogleDriveSync(args.local_dir, args.output_dir, args.folder_id, recursive)
+        manager = GoogleDriveSync(args.local_dir, args.output_dir, args.folder_id, recursive, notein=args.notein)
     else:
-        manager = CloudSyncManager(args.local_dir, args.output_dir)
+        manager = CloudSyncManager(args.local_dir, args.output_dir, notein=args.notein)
     
     def sync_once():
         """Perform one sync operation"""
