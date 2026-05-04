@@ -4,6 +4,8 @@
 
 This tool converts Noteshelf (Android) notes to PDF format. It extracts your handwritten notes from `.nsa` files and creates clean PDF documents. You can also sync files directly from Google Drive.
 
+This project currently also supports note-taking app **Notein**. More on that in *Usage*.
+
 ## Why?
 
 Noteshelf on Android itself supports sync and backup to multiple platforms. However, it doesn't offer any way of opening these synced files, the only usage is meant for backup and uploading it back to Noteshelf.
@@ -64,11 +66,20 @@ That's it! Dependencies are managed automatically.
 uv run nsa_convertor.py notes.nsa -o notes.pdf
 ```
 
+Notein support
+```bash
+uv run notein_extract.py <dir>
+```
+
+
 **Convert a whole folder:**
 ```bash
 uv run nsa_convertor.py /path/to/nsa/folder --outdir /path/to/pdfs
 ```
-
+Notein support
+```bash
+python sync_and_convert.py --provider local --local-dir <dir> --notein
+```
 or specify `DEFAULT_PATH` in `.env` and emit `--outdir`
 
 ## Google Drive Sync
@@ -147,6 +158,7 @@ uv run nsa_convertor.py notes.nsa -o notes.pdf \
 - `--epsilon`: Smoothing level for strokes (default: 0.8)
 - `--no-smooth`: Turn off smoothing
 - `--quiet`: Less output
+- `--notein`: support for notein
 
 ## How It Works
 
@@ -171,6 +183,5 @@ The converter:
 **Weird colors**: Try adjusting `--highlighter-opacity` and `--highlighter-ratio`
 
 ## About
-
 
 Created because no existing solution could convert Noteshelf files properly.
