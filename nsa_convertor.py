@@ -32,6 +32,13 @@ from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from tqdm import tqdm
+from dotenv import load_dotenv
+from pathlib import Path
+from prompt_toolkit import Application
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.layout import Layout
+from prompt_toolkit.widgets import TextArea
+from prompt_toolkit.application.current import get_app
 
 import fitz  # PyMuPDF
 
@@ -40,6 +47,11 @@ MIN_CURVE_SAMPLES = 2
 MAX_CURVE_SAMPLES = 8
 PRESSURE_WIDTH_QUANT = 0.2
 SHAPE_DEDUP_TOL = 1.0
+
+load_dotenv()
+DEFAULT_INPUT_PATH = os.getenv("DEFAULT_INPUT_PATH", ".")
+DEFAULT_OUTPUT_PATH = os.getenv("DEFAULT_OUTPUT_PATH", ".")
+NO_CONFIRMATION = os.getenv("NO_CONFIRMATION", "0") == "1"
 
 # -----------------------------
 # Helpers
@@ -1035,53 +1047,164 @@ def nsa_to_pdf(
         print(f"[+] Written: {out_pdf}")
 
 
+
+# -----------------------------
+# terminal navigator
+# -----------------------------
+
+
+def browse_path(start_path: str):
+    current = Path(start_path).expanduser().resolve()
+    index = 0
+
+    def get_entries():
+        return sorted(current.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+
+    output = TextArea(focusable=False)
+    kb = KeyBindings()
+
+    def render():
+        entries = get_entries()
+        lines = [f"Current: {current}\n"]
+
+        for i, p in enumerate(entries):
+            marker = "→" if i == index else " "
+            icon = "📁" if p.is_dir() else "📄"
+            lines.append(f"{marker} [{i}] {icon} {p.name}")
+
+        lines.append("\n↑↓ move | Enter open/select | c convert file/folder | Backspace up | q quit")
+        output.text = "\n".join(lines)
+
+    @kb.add("up")
+    def up(event):
+        nonlocal index
+        index = max(0, index - 1)
+        render()
+
+    @kb.add("down")
+    def down(event):
+        nonlocal index
+        entries = get_entries()
+        index = min(len(entries) - 1, index + 1)
+        render()
+
+    @kb.add("enter")
+    def enter(event):
+        nonlocal current, index
+        entries = get_entries()
+        target = entries[index]
+
+        if target.is_dir():
+            current = target
+            index = 0
+            render()
+        else:
+            event.app.exit(result=(target, "convert"))
+
+    @kb.add("backspace")
+    def up_dir(event):
+        nonlocal current, index
+        if current.parent != current:
+            current = current.parent
+            index = 0
+            render()
+
+    @kb.add("q")
+    def quit(event):
+        raise SystemExit()
+    
+    @kb.add("c")
+    def convert_item(event):
+        nonlocal current, index
+        entries = get_entries()
+        target = entries[index]
+        event.app.exit(result=(target, "convert"))
+
+    render()
+
+    app = Application(
+        layout=Layout(output),
+        key_bindings=kb,
+        full_screen=True
+    )
+
+    return app.run()
+
+
+def collect_nsa_files(path: Path):
+    if path.is_file() and path.suffix.lower() == ".nsa":
+        return [path]
+
+    return list(path.rglob("*.nsa"))
+
+
+def make_output_path(input_file: Path, input_root: Path, output_root: Path) -> str:
+    rel_path = input_file.relative_to(input_root)
+    return str((output_root / rel_path).with_suffix(".pdf"))
+
 # -----------------------------
 # CLI
 # -----------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Convert Noteshelf Android .nsa to PDF (template + annotations).")
-    ap.add_argument("input", help="Cesta k .nsa souboru nebo složce s .nsa")
-    ap.add_argument("-o", "--output", help="Výstupní PDF (pokud input je jeden soubor)")
-    ap.add_argument("--outdir", help="Výstupní složka (pokud input je složka)")
-    ap.add_argument("--quiet", action="store_true", help="Méně výpisů")
+    ap = argparse.ArgumentParser(description="Convert Noteshelf Android .nsa files into PDF (templates + annotations).")
 
-    ap.add_argument("--highlighter-opacity", type=float, default=0.38,
-                    help="Opacity of the highlighter (0..1). Default 0.38")
-    ap.add_argument("--highlighter-ratio", type=float, default=5.0,
-                    help="How much thicker the highlighter should be compared to the pen (ratio). Default 5.0")
+    ap.add_argument("input", nargs="?", default=None, help="Path to a .nsa file or a folder containing .nsa files. Optional if using .env default.")
 
-    ap.add_argument("--no-smooth", action="store_true",
-                    help="Disable smoothing (RDP).")
-    ap.add_argument("--curve", action="store_true", default=True,
-                    help="Use Catmull-Rom spline upsampling instead of RDP (default on).")
-    ap.add_argument("--no-curve", action="store_false", dest="curve",
-                    help="Disable curve smoothing (use RDP if enabled).")
-    ap.add_argument("--epsilon", type=float, default=0.8,
-                    help="RDP epsilon (greater = smoother, smaller = more precise). Default 0.8")
-    ap.add_argument("--pressure", action="store_true", default=True,
-                    help="Use per-segment width from stroke data (variable width). Works with --curve (default on).")
-    ap.add_argument("--no-pressure", action="store_false", dest="pressure",
-                    help="Disable variable width (pressure).")
+    ap.add_argument("-o", "--output", help="Output PDF file path (used when input is a single file).")
+
+    ap.add_argument("--outdir", help="Output directory (used when input is a folder).")
+
+    ap.add_argument("--quiet", action="store_true", help="Reduce console output (suppress verbose logging).")
+
+    ap.add_argument("--highlighter-opacity", type=float, default=0.38, help="Opacity of highlighter strokes (0.0–1.0). Default: 0.38")
+
+    ap.add_argument("--highlighter-ratio", type=float, default=5.0, help="Relative thickness of highlighter compared to pen strokes. Default: 5.0")
+
+    ap.add_argument("--no-smooth", action="store_true", help="Disable stroke smoothing (RDP algorithm).")
+
+    ap.add_argument("--curve", action="store_true", default=True, help="Enable Catmull-Rom curve interpolation for smoother strokes (default enabled).")
+
+    ap.add_argument("--no-curve", action="store_false", dest="curve", help="Disable curve interpolation (use simpler rendering).")
+
+    ap.add_argument("--epsilon", type=float, default=0.8, help="RDP simplification strength. Higher = smoother, lower = more precise. Default: 0.8")
+
+    ap.add_argument("--pressure", action="store_true", default=True, help="Enable stroke pressure simulation using variable width data (default enabled).")
+
+    ap.add_argument("--no-pressure", action="store_false", dest="pressure", help="Disable pressure simulation (fixed stroke width).")
 
     args = ap.parse_args()
     verbose = not args.quiet
     smooth = not args.no_smooth
 
-    in_path = args.input
+    if args.input:
+        input_root = Path(args.input).expanduser().resolve()
+    else:
+        print(f"[i] No input provided → using DEFAULT_INPUT_PATH: {DEFAULT_INPUT_PATH}")
+        selected, mode = browse_path(DEFAULT_INPUT_PATH)
+        input_root = Path(selected).expanduser().resolve()
 
-    if os.path.isdir(in_path):
-        outdir = args.outdir or os.path.join(in_path, "pdf_out")
-        os.makedirs(outdir, exist_ok=True)
+    input_root_name = input_root.name if input_root.is_dir() else input_root.stem
 
-        nsa_files = [f for f in os.listdir(in_path) if f.lower().endswith(".nsa")]
+
+    if input_root.is_dir():
+        output_root = Path(args.outdir or DEFAULT_OUTPUT_PATH).expanduser().resolve()
+        output_root = output_root / input_root_name
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        nsa_files = list(input_root.rglob("*.nsa"))
+
         if not nsa_files:
-            raise SystemExit("No .nsa files found in the directory  .")
+            raise SystemExit("No .nsa files found in the directory.")
 
         for f in sorted(nsa_files):
-            src = os.path.join(in_path, f)
-            base = os.path.splitext(f)[0]
-            dst = os.path.join(outdir, base + ".pdf")
+            src = str(f)
+
+            dst = make_output_path(
+                input_file=f,
+                input_root=input_root,
+                output_root=output_root
+            )
 
             nsa_to_pdf(
                 src, dst,
@@ -1095,19 +1218,21 @@ def main() -> None:
             )
 
         if verbose:
-            print(f"[+] Done. Output dir: {outdir}")
+            print(f"[+] Done. Output dir: {output_root}")
         return
 
-    if not in_path.lower().endswith(".nsa"):
+    if input_root.is_file() and input_root.suffix.lower() != ".nsa":        
         raise SystemExit("Input is not a .nsa file (or directory).")
 
     out_pdf = args.output
     if not out_pdf:
-        base = os.path.splitext(os.path.basename(in_path))[0]
-        out_pdf = os.path.join(os.path.dirname(in_path) or ".", base + ".pdf")
+        output_root = Path(DEFAULT_OUTPUT_PATH).expanduser().resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        out_pdf = str((output_root / input_root.stem).with_suffix(".pdf"))
 
     nsa_to_pdf(
-        in_path, out_pdf,
+        str(input_root), out_pdf,
         desired_highlighter_ratio=args.highlighter_ratio,
         highlighter_opacity=args.highlighter_opacity,
         smooth=smooth,
