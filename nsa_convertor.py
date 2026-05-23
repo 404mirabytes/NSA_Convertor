@@ -31,6 +31,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from tqdm import tqdm
 
 import fitz  # PyMuPDF
 
@@ -584,6 +585,17 @@ def open_template_cached(cache: Dict[str, fitz.Document], zf: zipfile.ZipFile, m
     cache[member] = doc
     return doc
 
+def rotate(x, y, w, h, rotation):
+    if rotation == 0:
+        return x, y
+    if rotation == 90:
+        return y, w - x
+    if rotation == 180:
+        return w - x, h - y
+    if rotation == 270:
+        return h - y, x
+    return x, y
+
 
 def draw_page_annotations(
     zf: zipfile.ZipFile,
@@ -599,6 +611,7 @@ def draw_page_annotations(
     epsilon: float,
     curve: bool,
     use_pressure: bool,
+    rotation: int=0
 ) -> None:
     ann_bytes = zf.read(ann_member)
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tf:
@@ -666,6 +679,8 @@ def draw_page_annotations(
 
             if invert_y:
                 y0 = out_page.rect.height - y0 - h
+
+            x0, y0 = rotate(x0, y0, out_page.rect.width, out_page.rect.height, rotation)
 
             rect = fitz.Rect(x0, y0, x0 + w, y0 + h)
             try:
@@ -750,6 +765,8 @@ def draw_page_annotations(
                 if invert_y:
                     Y1 = out_page.rect.height - Y1
                     Y2 = out_page.rect.height - Y2
+                X1, Y1 = rotate(X1, Y1, out_page.rect.width, out_page.rect.height, rotation)
+                X2, Y2 = rotate(X2, Y2, out_page.rect.width, out_page.rect.height, rotation)
                 seg_scaled.append((X1, Y1, X2, Y2, float(size)))
 
             col = int(strokeColor) if strokeColor is not None else 0
@@ -940,11 +957,23 @@ def nsa_to_pdf(
         out_doc = fitz.open()
 
         # Pro každou stránku vytvoř stránku v out_doc a dokresli anotace
-        for i, p in enumerate(pages, start=1):
+        for i, p in enumerate(
+                tqdm(
+                    pages, 
+                    total=len(pages),
+                    desc=f"Converting file {os.path.basename(nsa_path)}",
+                    unit="page",
+                    bar_format="{l_bar}{bar:30}| {n_fmt}/{total_fmt}",
+                    disable=not verbose
+                ),
+                start=1,
+            ):
             uuid = p.get("uuid")
             tpl_name = p.get("associatedPDFFileName") or next(iter(doc.get("documents", {}).keys()), None)
             pdf_idx_1based = p.get("associatedPDFKitPageIndex") or p.get("associatedPageIndex") or 1
             tpl_basename = os.path.basename(tpl_name) if tpl_name else None
+
+            rotation = int(p.get("rotationAngle", 0) or 0)
 
             # 1) vlož template stránku (nebo vytvoř blank)
             out_page: fitz.Page
@@ -962,7 +991,6 @@ def nsa_to_pdf(
             else:
                 dims = parse_pdfkit_rect(p.get("pdfKitPageRect", "")) or (1200.0, 1600.0)
                 out_page = out_doc.new_page(width=dims[0] * 0.5, height=dims[1] * 0.5)
-
             # 2) spočti scale Noteshelf coords -> PDF coords
             dims = parse_pdfkit_rect(p.get("pdfKitPageRect", "")) or None
             if dims:
@@ -971,6 +999,9 @@ def nsa_to_pdf(
                 sy = (out_page.rect.height / ph) if ph else 1.0
             else:
                 sx = sy = 1.0
+            
+            if rotation:
+                out_page.set_rotation(rotation)
 
             # 3) anotace
             if uuid and uuid in ann_index:
@@ -988,10 +1019,9 @@ def nsa_to_pdf(
                     epsilon=epsilon,
                     curve=curve,
                     use_pressure=use_pressure,
+                    rotation=rotation
                 )
 
-            if verbose and i % 10 == 0:
-                print(f"[i] Processed pages: {i}/{len(pages)}")
 
         # Close cached template docs
         for d in tpl_cache.values():
