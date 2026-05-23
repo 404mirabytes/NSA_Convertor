@@ -975,7 +975,7 @@ def nsa_to_pdf(
                     total=len(pages),
                     desc=f"Converting file {os.path.basename(nsa_path)}",
                     unit="page",
-                    bar_format="{l_bar}{bar:30}| {n_fmt}/{total_fmt}",
+                    bar_format="{l_bar}{bar:30}| {n_fmt}/{total_fmt} pages",
                     disable=not verbose
                 ),
                 start=1,
